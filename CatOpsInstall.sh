@@ -293,10 +293,7 @@ This installer will set up:
   • Apache web UI over HTTPS (self-signed certificate)
   • Secure firmware upload channel (stunnel, port 8443)
 
-DNS, DHCP and NTP services are set up later from
-the CatOps Lite web UI, not during installation.
-
-*********************************************" 20 65
+*********************************************" 17 65
   clear
 }
 
