@@ -14,10 +14,6 @@ INSTALL_BASE="/opt/cmds-go"
 LOGDIR="/var/log/cmds-installer"
 mkdir -p "$LOGDIR"
 
-# Optional service install flags (set by service_menu_checklist)
-INSTALL_BIND=0
-INSTALL_NTP=0
-INSTALL_DHCP=0
 
 
 clear
@@ -292,59 +288,18 @@ show_server_checklist() {
 
 This installer will set up:
   • Base system packages + security (fail2ban, SELinux)
-  • NTP time sync (optional)
-  • DHCP server via Kea (optional)
   • TFTP + HTTP image server for IOS-XE firmware
   • FastAPI backend (cmds-go service)
-  • Apache reverse proxy for the web UI
+  • Apache web UI over HTTPS (self-signed certificate)
+  • Secure firmware upload channel (stunnel, port 8443)
 
+DNS, DHCP and NTP services are set up later from
+the CatOps Lite web UI, not during installation.
 
-Have ready (if enabling optional services):
-  1. NTP server IPs or FQDNs (up to 3)
-  2. NTP allow subnet in CIDR (e.g., 192.168.1.0/24)
-  3. DHCP range start/end IPs
-  4. DHCP default gateway IP
-  5. DHCP domain suffix
-
-*********************************************" 26 65
+*********************************************" 20 65
   clear
 }
 
-# =============================================================
-# SERVICE SELECTION CHECKLIST
-# Matches CMDS2Install.sh service_menu_checklist() format.
-#   - Bind DNS (caching-only)
-#   - NTP (Chrony)
-#   - DHCP (Kea)
-#   - NONE (continue without optional services)
-# All questions are gathered UPFRONT before installation begins
-# so the rest of the install runs completely unattended.
-# =============================================================
-service_menu_checklist() {
-  clear
-  local BACKTITLE="Service Installer"
-  local TITLE="Install/Configure Services"
-
-  # Single-shot checklist (no loop-back)
-  local selection
-  selection=$(dialog --backtitle "$BACKTITLE" --title "$TITLE" --checklist \
-"Space = toggle; Enter = continue. You can pick more than one.
-Select \"Do not install any services (continue)\" to skip and move on." 19 80 8 \
-    BIND "Bind DNS (caching-only)"                   OFF \
-    KEA  "DHCP (Kea)"                                OFF \
-    NTP  "NTP (Chrony)"                              OFF \
-    NONE "Do not install any services (continue)"    OFF \
-    3>&1 1>&2 2>&3)
-
-  # shellcheck disable=SC2206
-  local rc=$?
-  [[ $rc -ne 0 ]] && return 0  # ESC/Cancel → continue main installer
-
-  [[ "$selection" == *BIND* ]] && INSTALL_BIND=1
-  [[ "$selection" == *KEA*  ]] && INSTALL_DHCP=1
-  [[ "$selection" == *NTP*  ]] && INSTALL_NTP=1
-  # NONE selected (or nothing) → all flags stay 0
-}
 
 # gather_service_config() removed — all service configuration is handled via the CatOps Lite UI.
 
@@ -488,6 +443,10 @@ update_and_install_packages() {
 
   # atd runs scheduled upgrades (scripts/upgrade/scheduled/sw_scheduled_submit.sh)
   systemctl enable --now atd >>"$log" 2>&1 || true
+  # chronyd keeps the server clock right (certificate validity, logs,
+  # upgrade schedules). Serving NTP to switches is configured later in
+  # the CatOps Lite UI, not here.
+  systemctl enable --now chronyd >>"$log" 2>&1 || true
 
   # Verify the commands CatOps Lite actually calls are present -- a
   # package that failed to install inside the gauge loop above is
@@ -531,71 +490,6 @@ vm_detection() {
   sleep 1
 }
 
-# =============================================================
-# BIND DNS — install only, UI handles configuration
-# =============================================================
-configure_bind_caching() {
-  [[ $INSTALL_BIND -eq 0 ]] && return 0
-  section "BIND DNS"
-  local log="$LOGDIR/bind.log"
-  : > "$log"
-
-  step_info "Installing BIND..."
-  dnf -y install bind bind-utils >>"$log" 2>&1
-  if [[ $? -ne 0 ]]; then
-    step_fail "BIND install failed — see ${log}"
-    return 1
-  fi
-
-  systemctl enable named >>"$log" 2>&1
-  echo "$(date '+%Y-%m-%d %H:%M:%S') BIND installed — awaiting UI configuration" >> "$log"
-  step_ok "BIND installed — configure forwarders and access via the CatOps Lite UI"
-  sleep 1
-}
-
-# =============================================================
-# STEP 12 — NTP / CHRONY — install only, UI handles configuration
-# =============================================================
-LOG_NTP="$LOGDIR/chrony.log"
-touch "$LOG_NTP"
-
-configure_ntp() {
-  [[ $INSTALL_NTP -eq 0 ]] && return 0
-  section "NTP / Chrony"
-  : > "$LOG_NTP"
-
-  step_info "Ensuring chrony is installed..."
-  dnf -y install chrony >>"$LOG_NTP" 2>&1 || true
-
-  systemctl enable chronyd >>"$LOG_NTP" 2>&1
-  echo "$(date '+%Y-%m-%d %H:%M:%S') Chrony installed — awaiting UI configuration" >> "$LOG_NTP"
-  step_ok "Chrony installed — configure NTP servers and clients via the CatOps Lite UI"
-  sleep 1
-}
-
-# =============================================================
-# STEP 13 — KEA DHCP SERVER — install only, UI handles configuration
-# =============================================================
-configure_dhcp_kea() {
-  [[ $INSTALL_DHCP -eq 0 ]] && return 0
-  section "DHCP Server (Kea)"
-  local log="$LOGDIR/kea-install.log"
-  : > "$log"
-
-  step_info "Installing Kea DHCP..."
-  # Rocky 10: upgrade openssl-libs first to avoid symbol errors
-  dnf -y upgrade --best --allowerasing openssl-libs >>"$log" 2>&1 || true
-  dnf -y install kea >>"$log" 2>&1
-  if [[ $? -ne 0 ]]; then
-    step_fail "Kea install failed — see ${log}"
-    return 1
-  fi
-
-  systemctl enable kea-dhcp4 >>"$log" 2>&1
-  echo "$(date '+%Y-%m-%d %H:%M:%S') Kea installed — awaiting UI configuration" >> "$log"
-  step_ok "Kea DHCP installed — configure scopes via the CatOps Lite UI"
-  sleep 1
-}
 
 # =============================================================
 # STEP 14 — FIREWALL
@@ -1536,36 +1430,6 @@ final_status_report() {
     fi
   done
 
-  echo ""
-  echo -e "  ${CYAN}Optional Services:${TEXTRESET}"
-
-  # DNS (BIND)
-  if [[ $INSTALL_BIND -eq 1 ]]; then
-    if systemctl is-active --quiet named 2>/dev/null; then
-      step_ok "named (DNS)"
-    else
-      step_ok "named (DNS) — installed, configure via the CatOps Lite UI"
-    fi
-  fi
-
-  # NTP (Chrony — optional install, not the core chronyd)
-  if [[ $INSTALL_NTP -eq 1 ]]; then
-    if systemctl is-active --quiet chronyd 2>/dev/null; then
-      step_ok "chronyd (NTP server) — installed, configure via the CatOps Lite UI"
-    else
-      step_ok "chronyd (NTP server) — installed, configure via the CatOps Lite UI"
-    fi
-  fi
-
-  # DHCP (Kea)
-  if [[ $INSTALL_DHCP -eq 1 ]]; then
-    if systemctl is-active --quiet kea-dhcp4 2>/dev/null; then
-      step_ok "kea-dhcp4"
-    else
-      step_ok "kea-dhcp4 — installed, configure via the CatOps Lite UI"
-    fi
-  fi
-
   local server_ip
   server_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || hostname -I | awk '{print $1}')
 
@@ -1622,14 +1486,10 @@ main() {
   check_internet_connectivity
   validate_and_set_hostname
   show_server_checklist     # welcome + "have these ready" notice BEFORE service selection
-  service_menu_checklist    # operator picks optional services to install
   enable_repos
   run_system_upgrade
   update_and_install_packages
   vm_detection
-  configure_bind_caching
-  configure_ntp
-  configure_dhcp_kea
   configure_firewall
   configure_fail2ban
   update_issue_file
