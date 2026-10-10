@@ -639,6 +639,15 @@ http_repo_setup_module() {
 
   mkdir -p "${TFTP_ROOT}/images" "${TFTP_ROOT}/hybrid" "${TFTP_ROOT}/wlc" "${TFTP_ROOT}/mig" >>"$log" 2>&1
 
+  # Config-backup drop folder: switches write their configs to
+  # tftp://<server>/archive/ (Archive CFG, sw_archive_provision.sh).
+  # in.tftpd runs "-c" as nobody, so the folder has to exist and be
+  # writable by nobody. Not published over HTTP (no Alias below) -- the
+  # backups can contain credentials.
+  mkdir -p "${TFTP_ROOT}/archive" >>"$log" 2>&1
+  chown nobody:nobody "${TFTP_ROOT}/archive" >>"$log" 2>&1 || true
+  chmod 0750 "${TFTP_ROOT}/archive" >>"$log" 2>&1 || true
+
   cat > "$SITE_CONF" <<CONF
 # Serve firmware images over HTTP.
 # /images MUST stay plain HTTP: switches pull IOS-XE images from
@@ -662,6 +671,9 @@ CONF
     semanage fcontext -a -t public_content_rw_t "${TFTP_ROOT}/images(/.*)?" >>"$log" 2>&1 \
       || semanage fcontext -m -t public_content_rw_t "${TFTP_ROOT}/images(/.*)?" >>"$log" 2>&1 || true
     restorecon -RFv "${TFTP_ROOT}/images" >>"$log" 2>&1 || true
+    semanage fcontext -a -t public_content_rw_t "${TFTP_ROOT}/archive(/.*)?" >>"$log" 2>&1 \
+      || semanage fcontext -m -t public_content_rw_t "${TFTP_ROOT}/archive(/.*)?" >>"$log" 2>&1 || true
+    restorecon -RFv "${TFTP_ROOT}/archive" >>"$log" 2>&1 || true
   fi
   setsebool -P tftp_anon_write on >>"$log" 2>&1 || true
 
