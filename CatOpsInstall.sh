@@ -1,0 +1,1685 @@
+#!/usr/bin/env bash
+# CatOps Lite Main Installer  (fumatchu/CatOps)
+# Requires: Rocky Linux 10.1+, run as root
+
+GREEN="\033[0;32m"
+RED="\033[0;31m"
+YELLOW="\033[1;33m"
+TEXTRESET="\033[0m"
+CYAN="\e[36m"
+RESET="\e[0m"
+
+SRC_BASE="/root/CatOpsInstaller"
+INSTALL_BASE="/opt/cmds-go"
+LOGDIR="/var/log/cmds-installer"
+mkdir -p "$LOGDIR"
+
+# Optional service install flags (set by service_menu_checklist)
+INSTALL_BIND=0
+INSTALL_NTP=0
+INSTALL_DHCP=0
+
+
+clear
+echo -e "${CYAN}CatOps Lite${TEXTRESET} ${YELLOW}Installation${TEXTRESET}"
+
+# =============================================================
+# STATUS OUTPUT HELPERS
+# step_ok "message"   -> [✓] message  (green)
+# step_fail "message" -> [✗] message  (red)
+# step_info "message" -> [→] message  (yellow)
+# =============================================================
+step_ok()   { echo -e "  [${GREEN}✓${TEXTRESET}] $*"; }
+step_fail() { echo -e "  [${RED}✗${TEXTRESET}] $*"; }
+step_info() { echo -e "  [${YELLOW}→${TEXTRESET}] $*"; }
+section()   { echo ""; echo -e "${CYAN}── $* ──${TEXTRESET}"; }
+
+# =============================================================
+# VALIDATION HELPERS
+# =============================================================
+validate_cidr() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$ ]]; }
+validate_ip()   { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+validate_fqdn() { [[ "$1" =~ ^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$ ]]; }
+
+check_hostname_in_domain() {
+  local fqdn="$1" hostname="${1%%.*}" domain="${1#*.}"
+  [[ ! "$domain" =~ (^|\.)"$hostname"(\.|$) ]]
+}
+
+ip_to_int() { local IFS=.; read -r a b c d <<<"$1"; echo $(( (a<<24)+(b<<16)+(c<<8)+d )); }
+int_to_ip() { local i=$1; printf "%d.%d.%d.%d" $(( (i>>24)&255 )) $(( (i>>16)&255 )) $(( (i>>8)&255 )) $(( i&255 )); }
+cidr_to_netmask() { local c=$1 m=$(( 0xFFFFFFFF << (32-$1) & 0xFFFFFFFF )); int_to_ip "$m"; }
+network_from_ip_cidr() { int_to_ip $(( $(ip_to_int "$1") & $(( 0xFFFFFFFF << (32-$2) & 0xFFFFFFFF )) )); }
+broadcast_from_ip_cidr() { int_to_ip $(( $(ip_to_int "$1") | (~$(( 0xFFFFFFFF << (32-$2) & 0xFFFFFFFF )) & 0xFFFFFFFF) )); }
+ip_in_cidr() {
+  local m=$(( 0xFFFFFFFF << (32-$3) & 0xFFFFFFFF ))
+  (( ( $(ip_to_int "$1") & m ) == ( $(ip_to_int "$2") & m ) ))
+}
+is_valid_ip() {
+  [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS=.; local o; for o in $1; do [[ $o -ge 0 && $o -le 255 ]] || return 1; done
+}
+is_valid_domain() {
+  [[ -n "$1" ]] || return 1
+  [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+# =============================================================
+# STEP 1 — ROOT + OS CHECK
+# =============================================================
+check_root_and_os() {
+  section "System Checks"
+
+  if [[ $EUID -eq 0 ]]; then
+    step_ok "Running as root"
+  else
+    step_fail "Must be run as root"
+    exit 1
+  fi
+
+  if [[ -f /etc/redhat-release ]]; then
+    MAJOROS=$(grep -oP '\d+' /etc/redhat-release | head -1)
+  else
+    step_fail "/etc/redhat-release not found — cannot detect OS"
+    exit 1
+  fi
+
+  if [[ "$MAJOROS" -ge 10 ]]; then
+    step_ok "OS check passed (Rocky Linux ${MAJOROS}.x)"
+  else
+    step_fail "Rocky Linux 10+ required (detected: ${MAJOROS})"
+    exit 1
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 2 — SELINUX
+# =============================================================
+check_and_enable_selinux() {
+  section "SELinux"
+  local status; status=$(getenforce 2>/dev/null || echo "Unknown")
+
+  if [[ "$status" == "Enforcing" ]]; then
+    step_ok "SELinux is Enforcing"
+  else
+    step_info "SELinux is ${status} — enabling..."
+    sed -i 's/SELINUX=disabled/SELINUX=enforcing/' /etc/selinux/config
+    sed -i 's/SELINUX=permissive/SELINUX=enforcing/' /etc/selinux/config
+    setenforce 1 2>/dev/null || true
+    if [[ "$(getenforce)" == "Enforcing" ]]; then
+      step_ok "SELinux enabled (Enforcing)"
+    else
+      step_fail "SELinux could not be set to Enforcing — check config manually"
+    fi
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 3 — NETWORK INTERFACE DETECTION
+# =============================================================
+detect_active_interface() {
+  section "Network Interface"
+  clear
+  dialog --backtitle "Network Setup" --title "Interface Check" \
+    --infobox "Detecting active network interface..." 5 50; sleep 2
+  clear
+
+  INTERFACE=$(nmcli -t -f DEVICE,TYPE,STATE device | grep "ethernet:connected" | cut -d: -f1 | head -n1)
+  [[ -z "$INTERFACE" ]] && INTERFACE=$(ip -o -4 addr show up | grep -v ' lo ' | awk '{print $2}' | head -n1)
+
+  if [[ -n "$INTERFACE" ]]; then
+    CONNECTION=$(nmcli -t -f NAME,DEVICE connection show | grep ":$INTERFACE" | cut -d: -f1)
+  fi
+
+  echo "INTERFACE=$INTERFACE CONNECTION=$CONNECTION" >> /tmp/cmds_install_debug.log
+
+  if [[ -z "$INTERFACE" || -z "$CONNECTION" ]]; then
+    dialog --title "Interface Error" --msgbox "No active network interface found." 6 50
+    exit 1
+  fi
+
+  step_ok "Interface: ${INTERFACE} (${CONNECTION})"
+  export INTERFACE CONNECTION
+  sleep 1
+}
+
+# =============================================================
+# STEP 4 — STATIC IP (if DHCP detected)
+# =============================================================
+prompt_static_ip_if_dhcp() {
+  section "IP Configuration"
+  IP_METHOD=$(nmcli -g ipv4.method connection show "$CONNECTION" | tr -d '' | xargs)
+
+  if [[ "$IP_METHOD" == "manual" ]]; then
+    step_ok "Static IP already configured on ${INTERFACE}"
+    return
+  fi
+
+  if [[ "$IP_METHOD" == "auto" ]]; then
+    step_info "DHCP detected on ${INTERFACE} — static IP required"
+    clear
+    while true; do
+      while true; do
+        IPADDR=$(dialog --backtitle "Network Setup" --title "Static IP Required" \
+          --inputbox "DHCP detected on '${INTERFACE}'\n\nEnter static IP in CIDR format (e.g., 192.168.1.100/24):" \
+          9 75 3>&1 1>&2 2>&3)
+        validate_cidr "$IPADDR" && break || dialog --msgbox "Invalid CIDR format. Try again." 6 40
+      done
+      while true; do
+        GW=$(dialog --backtitle "Network Setup" --title "Gateway" \
+          --inputbox "Enter default gateway:" 8 60 3>&1 1>&2 2>&3)
+        validate_ip "$GW" && break || dialog --msgbox "Invalid IP. Try again." 6 40
+      done
+      while true; do
+        DNSSERVER=$(dialog --backtitle "Network Setup" --title "DNS Server" \
+          --inputbox "Enter upstream DNS server IP:" 8 60 3>&1 1>&2 2>&3)
+        validate_ip "$DNSSERVER" && break || dialog --msgbox "Invalid IP. Try again." 6 40
+      done
+      while true; do
+        HOSTNAME=$(dialog --backtitle "Network Setup" --title "FQDN" \
+          --inputbox "Enter FQDN (e.g., cmds.domain.com):" 8 60 3>&1 1>&2 2>&3)
+        if validate_fqdn "$HOSTNAME" && check_hostname_in_domain "$HOSTNAME"; then break
+        else dialog --msgbox "Invalid FQDN. Try again." 6 50; fi
+      done
+      while true; do
+        DNSSEARCH=$(dialog --backtitle "Network Setup" --title "DNS Search Domain" \
+          --inputbox "Enter DNS search domain (e.g., domain.com):" 8 60 3>&1 1>&2 2>&3)
+        [[ -n "$DNSSEARCH" ]] && break || dialog --msgbox "Search domain cannot be blank." 6 40
+      done
+
+      dialog --backtitle "Network Setup" --title "Confirm Settings" \
+        --yesno "Apply these settings?\n\nInterface: ${INTERFACE}\nIP: ${IPADDR}\nGateway: ${GW}\nFQDN: ${HOSTNAME}\nDNS: ${DNSSERVER}\nSearch: ${DNSSEARCH}" \
+        13 60
+
+      if [[ $? -eq 0 ]]; then
+        nmcli con mod "$CONNECTION" ipv4.address "$IPADDR"
+        nmcli con mod "$CONNECTION" ipv4.gateway "$GW"
+        nmcli con mod "$CONNECTION" ipv4.method manual
+        nmcli con mod "$CONNECTION" ipv4.dns "$DNSSERVER"
+        nmcli con mod "$CONNECTION" ipv4.dns-search "$DNSSEARCH"
+        hostnamectl set-hostname "$HOSTNAME"
+
+        # Write resume marker with the expected IP so it can be validated
+        # after reboot before continuing the install.
+        echo "ip=${IPADDR%%/*}" > /root/.cmds_install_resume
+
+        # Hook /root/.bashrc so logging in as root after the reboot
+        # automatically re-launches the installer to continue where it left off.
+        if ! grep -q "# BEGIN CATOPS-AUTORESUME" /root/.bashrc 2>/dev/null; then
+          cat >> /root/.bashrc << 'BASHRC_EOF'
+
+# BEGIN CATOPS-AUTORESUME
+# Added by CatOps Lite installer — removed automatically on first login after reboot.
+if [[ -f /root/.cmds_install_resume ]]; then
+    exec bash /root/CatOpsInstaller/CatOpsInstall.sh
+fi
+# END CATOPS-AUTORESUME
+BASHRC_EOF
+        fi
+
+        dialog --title "Reboot Required" \
+          --msgbox "Network configured. System will reboot.\n\nLog in as root at: ${IPADDR%%/*}\nThe installer will resume automatically." 9 62
+        reboot
+      fi
+    done
+  fi
+}
+
+# =============================================================
+# STEP 5 — INTERNET CONNECTIVITY
+# =============================================================
+check_internet_connectivity() {
+  section "Internet Connectivity"
+  local dns_ok=0 ip_ok=0
+
+  ping -c 1 -W 2 8.8.8.8 &>/dev/null && ip_ok=1
+  ping -c 1 -W 2 google.com &>/dev/null && dns_ok=1
+
+  [[ $ip_ok -eq 1 ]] && step_ok "Direct IP reachable (8.8.8.8)" || step_fail "Cannot reach 8.8.8.8"
+  [[ $dns_ok -eq 1 ]] && step_ok "DNS resolution working" || step_fail "DNS resolution failed"
+
+  if [[ $ip_ok -eq 0 || $dns_ok -eq 0 ]]; then
+    clear
+    dialog --title "Network Warning" \
+      --yesno "Internet connectivity issues detected.\n\nContinue anyway?" 8 55
+    local _nw=$?; clear
+    [[ $_nw -ne 0 ]] && exit 1
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 6 — HOSTNAME
+# =============================================================
+validate_and_set_hostname() {
+  section "Hostname"
+  local current; current=$(hostname)
+
+  if [[ "$current" == "localhost.localdomain" ]]; then
+    clear
+    while true; do
+      NEW_HOSTNAME=$(dialog --backtitle "Hostname Setup" --title "Set FQDN" \
+        --inputbox "Current hostname is '${current}'.\nEnter FQDN (e.g., cmds.example.com):" \
+        8 60 3>&1 1>&2 2>&3)
+      if validate_fqdn "$NEW_HOSTNAME" && check_hostname_in_domain "$NEW_HOSTNAME"; then
+        hostnamectl set-hostname "$NEW_HOSTNAME"
+        clear
+        step_ok "Hostname set to: ${NEW_HOSTNAME}"
+        break
+      else
+        dialog --msgbox "Invalid FQDN. Try again." 6 50
+      fi
+    done
+  else
+    step_ok "Hostname: ${current}"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 7 — PRE-INSTALL CHECKLIST
+# =============================================================
+show_server_checklist() {
+  clear
+  dialog --backtitle "CatOps Lite Installer" \
+    --title "Pre-Installation Checklist" \
+    --msgbox "\
+*********************************************
+  CatOps Lite Server Installation
+*********************************************
+
+This installer will set up:
+  • Base system packages + security (fail2ban, SELinux)
+  • NTP time sync (optional)
+  • DHCP server via Kea (optional)
+  • TFTP + HTTP image server for IOS-XE firmware
+  • FastAPI backend (cmds-go service)
+  • Apache reverse proxy for the web UI
+
+
+Have ready (if enabling optional services):
+  1. NTP server IPs or FQDNs (up to 3)
+  2. NTP allow subnet in CIDR (e.g., 192.168.1.0/24)
+  3. DHCP range start/end IPs
+  4. DHCP default gateway IP
+  5. DHCP domain suffix
+
+*********************************************" 26 65
+  clear
+}
+
+# =============================================================
+# SERVICE SELECTION CHECKLIST
+# Matches CMDS2Install.sh service_menu_checklist() format.
+#   - Bind DNS (caching-only)
+#   - NTP (Chrony)
+#   - DHCP (Kea)
+#   - NONE (continue without optional services)
+# All questions are gathered UPFRONT before installation begins
+# so the rest of the install runs completely unattended.
+# =============================================================
+service_menu_checklist() {
+  clear
+  local BACKTITLE="Service Installer"
+  local TITLE="Install/Configure Services"
+
+  # Single-shot checklist (no loop-back)
+  local selection
+  selection=$(dialog --backtitle "$BACKTITLE" --title "$TITLE" --checklist \
+"Space = toggle; Enter = continue. You can pick more than one.
+Select \"Do not install any services (continue)\" to skip and move on." 19 80 8 \
+    BIND "Bind DNS (caching-only)"                   OFF \
+    KEA  "DHCP (Kea)"                                OFF \
+    NTP  "NTP (Chrony)"                              OFF \
+    NONE "Do not install any services (continue)"    OFF \
+    3>&1 1>&2 2>&3)
+
+  # shellcheck disable=SC2206
+  local rc=$?
+  [[ $rc -ne 0 ]] && return 0  # ESC/Cancel → continue main installer
+
+  [[ "$selection" == *BIND* ]] && INSTALL_BIND=1
+  [[ "$selection" == *KEA*  ]] && INSTALL_DHCP=1
+  [[ "$selection" == *NTP*  ]] && INSTALL_NTP=1
+  # NONE selected (or nothing) → all flags stay 0
+}
+
+# gather_service_config() removed — all service configuration is handled via the CatOps Lite UI.
+
+# =============================================================
+# STEP 8 — EPEL + CRB REPOS
+# =============================================================
+enable_repos() {
+  section "Repository Setup"
+  local log="$LOGDIR/repo-setup.log"
+  : > "$log"
+
+  local PIPE; PIPE=$(mktemp -u); mkfifo "$PIPE"
+
+  clear
+  dialog --backtitle "Repository Setup" --title "Enabling Repositories" \
+    --gauge "Initializing..." 10 70 0 < "$PIPE" &
+
+  local RC=0
+  {
+    echo "10"; echo "XXX"; echo "Installing EPEL release..."; echo "XXX"
+    dnf -y install epel-release --setopt=install_weak_deps=False --color=never >>"$log" 2>&1 || RC=1
+
+    echo "40"; echo "XXX"; echo "Installing dnf-plugins-core..."; echo "XXX"
+    dnf -y install dnf-plugins-core --setopt=install_weak_deps=False --color=never >>"$log" 2>&1 || true
+
+    echo "65"; echo "XXX"; echo "Enabling CRB repository..."; echo "XXX"
+    dnf config-manager --set-enabled crb --color=never >>"$log" 2>&1 || true
+
+    echo "85"; echo "XXX"; echo "Refreshing package cache..."; echo "XXX"
+    dnf -y makecache --refresh --color=never >>"$log" 2>&1 || RC=1
+
+    echo "100"; echo "XXX"; echo "Repositories enabled."; echo "XXX"
+  } > "$PIPE"
+  wait; rm -f "$PIPE"
+  clear
+
+  if [[ $RC -eq 0 ]]; then
+    step_ok "EPEL + CRB enabled"
+  else
+    step_fail "Repo setup had errors — see ${log}"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 9 — FULL SYSTEM UPGRADE
+# =============================================================
+run_system_upgrade() {
+  section "System Upgrade"
+  local log="$LOGDIR/system-upgrade.log"
+  : > "$log"
+
+  step_info "Running dnf upgrade (this may take a while)..."
+
+  local PIPE; PIPE=$(mktemp -u); mkfifo "$PIPE"
+  mapfile -t PACKAGE_LIST < <(dnf -q repoquery --upgrades --qf '%{name}' 2>/dev/null | sort -u)
+  local TOTAL=${#PACKAGE_LIST[@]}
+
+  if [[ $TOTAL -eq 0 ]]; then
+    step_ok "System already up to date"
+    rm -f "$PIPE"; return
+  fi
+
+  clear
+  dialog --backtitle "System Upgrade" --title "Upgrading Packages" \
+    --gauge "Starting system upgrade..." 10 70 0 < "$PIPE" &
+
+  local COUNT=0
+  {
+    for PKG in "${PACKAGE_LIST[@]}"; do
+      ((COUNT++))
+      local PCT=$(( COUNT * 100 / TOTAL ))
+      echo "$PCT"; echo "XXX"; echo "Upgrading: $PKG"; echo "XXX"
+      dnf -y -q upgrade --color=never --best --allowerasing "$PKG" >>"$log" 2>&1
+    done
+    echo "100"; echo "XXX"; echo "Upgrade complete."; echo "XXX"
+  } > "$PIPE"
+  wait; rm -f "$PIPE"
+  clear
+
+  step_ok "System packages upgraded (${TOTAL} packages)"
+  sleep 1
+}
+
+# =============================================================
+# STEP 10 — REQUIRED PACKAGE INSTALL
+# =============================================================
+update_and_install_packages() {
+  section "Required Packages"
+  local log="$LOGDIR/packages.log"
+  : > "$log"
+
+  local REQUIRED_PKGS=(
+    ntsysv gcc tar nmap openssl openssl-devel make at bc bzip2-devel
+    libffi-devel zlib-devel nano rsync sshpass openldap-clients
+    fail2ban tuned
+    net-tools dmidecode ipcalc bind-utils iotop zip
+    yum-utils curl wget dnf-automatic dnf-plugins-core
+    util-linux htop expect iptraf-ng mc
+    httpd mod_ssl stunnel
+    python3 python3-pip pam-devel
+    tftp-server acl
+    policycoreutils-python-utils
+    chrony
+    jq dialog
+  )
+  # What each CatOps Lite feature needs (audited 2026-10-10 against
+  # scripts/, lib/ and api/):
+  #   httpd mod_ssl          -- HTTPS UI/API on 443 (self-signed cert)
+  #   stunnel                -- wss://:8443 for IOS-XE image uploads
+  #   openssl                -- certificate generation
+  #   sshpass expect         -- SSH/enable sessions to switches (lib/cmds_ssh.sh, Card 1)
+  #   jq                     -- JSON handling in discovery/upgrade scripts
+  #   at                     -- scheduled upgrades (atd)
+  #   nmap                   -- subnet discovery
+  #   curl wget rsync tar    -- downloads, Platform Updates
+  #   tftp-server            -- image/config transfer to switches
+  #   bind-utils             -- dig (DNS checks)
+  #   acl                    -- setfacl (strip SFTP ACLs on web files)
+  #   policycoreutils-python-utils -- semanage (SELinux contexts)
+  #   python3 python3-pip pam-devel -- FastAPI backend, PAM login
+
+  local TOTAL=${#REQUIRED_PKGS[@]} COUNT=0
+  local PIPE; PIPE=$(mktemp -u); mkfifo "$PIPE"
+
+  clear
+  dialog --backtitle "Package Install" --title "Installing Required Packages" \
+    --gauge "Preparing..." 10 70 0 < "$PIPE" &
+
+  {
+    for PKG in "${REQUIRED_PKGS[@]}"; do
+      ((COUNT++))
+      local PCT=$(( COUNT * 100 / TOTAL ))
+      echo "$PCT"; echo "XXX"; echo "Installing: $PKG"; echo "XXX"
+      dnf -y -q install --color=never --setopt=tsflags=nodocs "$PKG" >>"$log" 2>&1
+    done
+    echo "100"; echo "XXX"; echo "Packages installed."; echo "XXX"
+  } > "$PIPE"
+  wait; rm -f "$PIPE"
+  clear
+
+  # atd runs scheduled upgrades (scripts/upgrade/scheduled/sw_scheduled_submit.sh)
+  systemctl enable --now atd >>"$log" 2>&1 || true
+
+  # Verify the commands CatOps Lite actually calls are present -- a
+  # package that failed to install inside the gauge loop above is
+  # otherwise silent.
+  local missing=() c
+  for c in sshpass expect jq nmap at curl wget rsync tar openssl stunnel setfacl semanage dig httpd python3; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if (( ${#missing[@]} )); then
+    step_fail "Missing after install: ${missing[*]} -- see ${log}"
+  else
+    step_ok "Required packages installed and verified"
+  fi
+  systemctl is-active --quiet atd && step_ok "atd running (scheduled upgrades)" || step_fail "atd not running -- scheduled upgrades will not fire"
+  sleep 1
+}
+
+# =============================================================
+# STEP 11 — VM GUEST TOOLS
+# =============================================================
+vm_detection() {
+  section "VM Guest Tools"
+
+  local kvm_hw vmware_hw
+  kvm_hw=$(dmidecode 2>/dev/null | grep -i -e manufacturer -e product -e vendor | grep KVM | cut -c16- || true)
+  vmware_hw=$(dmidecode 2>/dev/null | grep -i "VMware, Inc." | head -1 || true)
+
+  if [[ "$kvm_hw" == "KVM" ]]; then
+    step_info "KVM detected — installing qemu-guest-agent..."
+    dnf -y install qemu-guest-agent >/dev/null 2>&1
+    systemctl enable --now qemu-guest-agent >/dev/null 2>&1 || true
+    step_ok "qemu-guest-agent installed"
+  elif [[ -n "$vmware_hw" ]]; then
+    step_info "VMware detected — installing open-vm-tools..."
+    dnf -y install open-vm-tools >/dev/null 2>&1
+    systemctl enable --now vmtoolsd >/dev/null 2>&1 || true
+    step_ok "open-vm-tools installed"
+  else
+    step_ok "No hypervisor guest tools needed (physical or unsupported platform)"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# BIND DNS — install only, UI handles configuration
+# =============================================================
+configure_bind_caching() {
+  [[ $INSTALL_BIND -eq 0 ]] && return 0
+  section "BIND DNS"
+  local log="$LOGDIR/bind.log"
+  : > "$log"
+
+  step_info "Installing BIND..."
+  dnf -y install bind bind-utils >>"$log" 2>&1
+  if [[ $? -ne 0 ]]; then
+    step_fail "BIND install failed — see ${log}"
+    return 1
+  fi
+
+  systemctl enable named >>"$log" 2>&1
+  echo "$(date '+%Y-%m-%d %H:%M:%S') BIND installed — awaiting UI configuration" >> "$log"
+  step_ok "BIND installed — configure forwarders and access via the CatOps Lite UI"
+  sleep 1
+}
+
+# =============================================================
+# STEP 12 — NTP / CHRONY — install only, UI handles configuration
+# =============================================================
+LOG_NTP="$LOGDIR/chrony.log"
+touch "$LOG_NTP"
+
+configure_ntp() {
+  [[ $INSTALL_NTP -eq 0 ]] && return 0
+  section "NTP / Chrony"
+  : > "$LOG_NTP"
+
+  step_info "Ensuring chrony is installed..."
+  dnf -y install chrony >>"$LOG_NTP" 2>&1 || true
+
+  systemctl enable chronyd >>"$LOG_NTP" 2>&1
+  echo "$(date '+%Y-%m-%d %H:%M:%S') Chrony installed — awaiting UI configuration" >> "$LOG_NTP"
+  step_ok "Chrony installed — configure NTP servers and clients via the CatOps Lite UI"
+  sleep 1
+}
+
+# =============================================================
+# STEP 13 — KEA DHCP SERVER — install only, UI handles configuration
+# =============================================================
+configure_dhcp_kea() {
+  [[ $INSTALL_DHCP -eq 0 ]] && return 0
+  section "DHCP Server (Kea)"
+  local log="$LOGDIR/kea-install.log"
+  : > "$log"
+
+  step_info "Installing Kea DHCP..."
+  # Rocky 10: upgrade openssl-libs first to avoid symbol errors
+  dnf -y upgrade --best --allowerasing openssl-libs >>"$log" 2>&1 || true
+  dnf -y install kea >>"$log" 2>&1
+  if [[ $? -ne 0 ]]; then
+    step_fail "Kea install failed — see ${log}"
+    return 1
+  fi
+
+  systemctl enable kea-dhcp4 >>"$log" 2>&1
+  echo "$(date '+%Y-%m-%d %H:%M:%S') Kea installed — awaiting UI configuration" >> "$log"
+  step_ok "Kea DHCP installed — configure scopes via the CatOps Lite UI"
+  sleep 1
+}
+
+# =============================================================
+# STEP 14 — FIREWALL
+# =============================================================
+configure_firewall() {
+  section "Firewall"
+
+  firewall-cmd --permanent --add-service=tftp    >/dev/null 2>&1
+  firewall-cmd --permanent --add-service=ntp     >/dev/null 2>&1
+  firewall-cmd --permanent --add-service=http    >/dev/null 2>&1
+  firewall-cmd --permanent --add-service=https   >/dev/null 2>&1
+
+  # Port 8000 is NOT opened: uvicorn listens on 127.0.0.1 only -- every
+  # browser request goes through Apache (443) or stunnel (8443, uploads).
+  firewall-cmd --permanent --remove-port=8000/tcp >/dev/null 2>&1 || true
+  # Port 8443: stunnel TLS wrapper for the same upload WebSocket (wss://)
+  # so it works from the HTTPS UI. Plain TCP relay -> 127.0.0.1:8000.
+  firewall-cmd --permanent --add-port=8443/tcp   >/dev/null 2>&1
+  firewall-cmd --reload >/dev/null 2>&1
+  systemctl restart firewalld >/dev/null 2>&1
+
+  local svcs; svcs=$(firewall-cmd --list-services 2>/dev/null)
+  step_ok "Firewall rules applied: ${svcs}"
+  sleep 1
+}
+
+# =============================================================
+# STEP 15 — FAIL2BAN
+# =============================================================
+configure_fail2ban() {
+  section "Fail2ban"
+  local log="$LOGDIR/fail2ban.log"
+  : > "$log"
+
+  local orig="/etc/fail2ban/jail.conf"
+  local local_f="/etc/fail2ban/jail.local"
+  local sshd_f="/etc/fail2ban/jail.d/sshd.local"
+
+  cp "$orig" "$local_f" >>"$log" 2>&1 || { step_fail "Cannot copy jail.conf"; return 1; }
+  sed -i '/^\[sshd\]/,/^$/ s/#mode.*normal/&\nenabled = true/' "$local_f" >>"$log" 2>&1
+
+  cat > "$sshd_f" <<'EOF'
+[sshd]
+enabled = true
+maxretry = 5
+findtime = 300
+bantime = 3600
+bantime.increment = true
+bantime.factor = 2
+EOF
+
+  systemctl enable --now fail2ban >>"$log" 2>&1
+  sleep 2
+
+  if systemctl is-active --quiet fail2ban; then
+    step_ok "Fail2ban running (SSH jail active)"
+  else
+    # Try SELinux recovery
+    restorecon -v /etc/fail2ban/jail.local >>"$log" 2>&1 || true
+    systemctl restart fail2ban >>"$log" 2>&1
+    if systemctl is-active --quiet fail2ban; then
+      step_ok "Fail2ban running (after SELinux fix)"
+    else
+      step_fail "Fail2ban failed to start — see ${log}"
+    fi
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 16 — /etc/issue LOGIN BANNER
+# =============================================================
+update_issue_file() {
+  section "Login Banner"
+  cat > /etc/issue <<'EOF'
+\S
+Kernel \r on an \m
+Hostname: \n
+IP Address: \4
+EOF
+  step_ok "/etc/issue updated (shows hostname + IP at login)"
+  sleep 1
+}
+
+# =============================================================
+# STEP 17 — BRACKETED PASTE
+# =============================================================
+disable_bracketed_paste() {
+  section "Terminal Settings"
+  if grep -q 'enable-bracketed-paste' /etc/inputrc 2>/dev/null; then
+    step_ok "Bracketed paste already disabled"
+  else
+    sed -i '8i set enable-bracketed-paste off' /etc/inputrc
+    step_ok "Bracketed paste disabled in /etc/inputrc"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 18 — TFTP SERVER
+# =============================================================
+tftp_setup_module() {
+  section "TFTP Server"
+  local log="$LOGDIR/tftp.log"
+  local TFTP_ROOT="/var/lib/tftpboot"
+  local SVC="/etc/systemd/system/tftp-server.service"
+  local SOCK="/etc/systemd/system/tftp-server.socket"
+  : > "$log"
+
+  step_info "Configuring TFTP server..."
+
+  cp -f /usr/lib/systemd/system/tftp.service "$SVC"  >>"$log" 2>&1
+  cp -f /usr/lib/systemd/system/tftp.socket  "$SOCK" >>"$log" 2>&1
+
+  grep -q '^Service=' "$SOCK" \
+    && sed -i 's/^Service=.*/Service=tftp-server.service/' "$SOCK" \
+    || echo 'Service=tftp-server.service' >> "$SOCK"
+
+  sed -i '/^Requires=/c\Requires=tftp-server.socket' "$SVC" >>"$log" 2>&1 || true
+  sed -i '/^ExecStart=/c\ExecStart=/usr/sbin/in.tftpd -c -p -s /var/lib/tftpboot' "$SVC" >>"$log" 2>&1
+
+  mkdir -p "${TFTP_ROOT}/images" "${TFTP_ROOT}/hybrid" "${TFTP_ROOT}/wlc" \
+           "${TFTP_ROOT}/mig"    "${TFTP_ROOT}/cat"
+  chmod -R 777 "$TFTP_ROOT" >>"$log" 2>&1
+  restorecon -RFv "$TFTP_ROOT" >>"$log" 2>&1 || true
+  command -v setsebool >/dev/null 2>&1 && setsebool -P tftp_anon_write on >>"$log" 2>&1 || true
+
+  systemctl daemon-reload >>"$log" 2>&1
+  systemctl disable --now tftp.socket >>"$log" 2>&1 || true
+  systemctl enable --now tftp-server.socket >>"$log" 2>&1
+
+  if systemctl is-active --quiet tftp-server.socket; then
+    step_ok "TFTP server active (root: ${TFTP_ROOT})"
+  else
+    step_fail "TFTP server failed to start — see ${log}"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 19 — HTTP IMAGE REPO
+# =============================================================
+http_repo_setup_module() {
+  section "HTTP Image Repository"
+  local log="$LOGDIR/http-repo.log"
+  local TFTP_ROOT="/var/lib/tftpboot"
+  local SITE_CONF="/etc/httpd/conf.d/tftp-images.conf"
+  local SEND_FILE_CONF="/etc/httpd/conf.d/00-sendfile.conf"
+  : > "$log"
+
+  mkdir -p "${TFTP_ROOT}/images" "${TFTP_ROOT}/hybrid" "${TFTP_ROOT}/wlc" "${TFTP_ROOT}/mig" >>"$log" 2>&1
+
+  cat > "$SITE_CONF" <<CONF
+# Serve firmware images over HTTP.
+# /images MUST stay plain HTTP: switches pull IOS-XE images from
+# http://<server>/images during upgrades. cmds-go.conf exempts it from
+# the HTTP->HTTPS redirect.
+# /hybrid, /wlc and /mig are intentionally NOT published: they hold
+# config backups (with credentials). Config Viewer reads them through
+# the authenticated API (/api/migration/configs/*), not these aliases.
+Alias /images ${TFTP_ROOT}/images
+<Directory "${TFTP_ROOT}/images">
+    Options Indexes FollowSymLinks
+    AllowOverride None
+    Require all granted
+</Directory>
+CONF
+
+  echo "EnableSendfile Off" > "$SEND_FILE_CONF"
+
+  # SELinux for images dir
+  if command -v semanage >/dev/null 2>&1; then
+    semanage fcontext -a -t public_content_rw_t "${TFTP_ROOT}/images(/.*)?" >>"$log" 2>&1 \
+      || semanage fcontext -m -t public_content_rw_t "${TFTP_ROOT}/images(/.*)?" >>"$log" 2>&1 || true
+    restorecon -RFv "${TFTP_ROOT}/images" >>"$log" 2>&1 || true
+  fi
+  setsebool -P tftp_anon_write on >>"$log" 2>&1 || true
+
+  step_ok "HTTP image aliases configured (${SITE_CONF})"
+  sleep 1
+}
+
+# =============================================================
+# STEP 20 — IOS-XE IMAGES SYMLINK
+# =============================================================
+create_iosxe_symlink_module() {
+  section "IOS-XE Images Symlink"
+  local LINK="/root/IOS-XE_images"
+  local TARGET="/var/lib/tftpboot/images"
+
+  mkdir -p "$TARGET"; chmod 755 "$TARGET"
+
+  if [[ -L "$LINK" && "$(readlink -f "$LINK")" == "$(readlink -f "$TARGET")" ]]; then
+    step_ok "Symlink already correct: ${LINK} → ${TARGET}"
+  else
+    rm -rf -- "$LINK" 2>/dev/null || true
+    ln -sfn "$TARGET" "$LINK"
+    step_ok "Symlink created: ${LINK} → ${TARGET}"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 21 — IMAGES AUTO-FIX DAEMON
+# =============================================================
+images_autofix_module() {
+  section "Images Auto-Fix Daemon"
+  local IMAGES_DIR="/var/lib/tftpboot/images"
+  local FIX_SCRIPT="/usr/local/sbin/tftp-images-autofix.sh"
+  local SVC="/etc/systemd/system/tftp-images-autofix.service"
+  local PATHU="/etc/systemd/system/tftp-images-autofix.path"
+  local TIMER="/etc/systemd/system/tftp-images-autofix.timer"
+  local log="$LOGDIR/images-autofix.log"
+  : > "$log"
+
+  mkdir -p "$IMAGES_DIR" >>"$log" 2>&1
+
+  cat > "$FIX_SCRIPT" <<'SH'
+#!/usr/bin/env bash
+IMAGES_DIR="/var/lib/tftpboot/images"
+[[ -d "$IMAGES_DIR" ]] || exit 0
+exec 9>/run/tftp-images-autofix.lock
+flock -n 9 || exit 0
+export LANG=C LC_ALL=C
+STATE="/run/tftp-images-autofix.state"
+now=$(date +%s); last=0
+[[ -f "$STATE" ]] && last=$(<"$STATE" || echo 0)
+(( last > 0 && now - last < 2 )) && exit 0
+[[ -f "$STATE" ]] && ! find "$IMAGES_DIR" -type f -newer "$STATE" -print -quit | grep -q . && exit 0
+command -v semanage >/dev/null 2>&1 && {
+  semanage fcontext -m -t public_content_rw_t "$IMAGES_DIR(/.*)?" >/dev/null 2>&1 \
+    || semanage fcontext -a -t public_content_rw_t "$IMAGES_DIR(/.*)?" >/dev/null 2>&1
+}
+restorecon -RF "$IMAGES_DIR" >/dev/null 2>&1 || true
+chmod -R a+rX "$IMAGES_DIR" >/dev/null 2>&1 || true
+echo "$now" > "$STATE"
+logger -t tftp-images-autofix "Repaired labels/perms under $IMAGES_DIR" 2>/dev/null || true
+exit 0
+SH
+  chmod 755 "$FIX_SCRIPT"
+
+  cat > "$SVC" <<SERVICE
+[Unit]
+Description=Auto-fix SELinux labels/perms under ${IMAGES_DIR}
+ConditionPathExists=${IMAGES_DIR}
+StartLimitIntervalSec=0
+[Service]
+Type=oneshot
+ExecStart=${FIX_SCRIPT}
+Nice=10
+SERVICE
+
+  cat > "$PATHU" <<PATHUNIT
+[Unit]
+Description=Watch ${IMAGES_DIR} for changes
+[Path]
+Unit=tftp-images-autofix.service
+MakeDirectory=true
+PathModified=${IMAGES_DIR}
+[Install]
+WantedBy=paths.target
+PATHUNIT
+
+  cat > "$TIMER" <<TIMERUNIT
+[Unit]
+Description=Periodic auto-fix for ${IMAGES_DIR}
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=tftp-images-autofix.service
+[Install]
+WantedBy=timers.target
+TIMERUNIT
+
+  systemctl daemon-reload >>"$log" 2>&1
+  systemctl reset-failed tftp-images-autofix.service 2>/dev/null || true
+  systemctl enable --now tftp-images-autofix.path  >>"$log" 2>&1
+  systemctl enable --now tftp-images-autofix.timer >>"$log" 2>&1
+  systemctl start tftp-images-autofix.service >>"$log" 2>&1 || true
+
+  step_ok "Images auto-fix daemon active (path watcher + 30s timer)"
+  sleep 1
+}
+
+# =============================================================
+# STEP 22 — PYTHON + PIP PACKAGES
+# =============================================================
+install_python_packages() {
+  section "Python / FastAPI"
+  local log="$LOGDIR/python.log"
+  : > "$log"
+
+  step_info "Upgrading pip..."
+  python3 -m pip install --upgrade pip setuptools wheel >>"$log" 2>&1
+
+  local PACKAGES=(
+    "fastapi"
+    "uvicorn[standard]"
+    "python-multipart"
+    "python-pam"
+    "pexpect"
+    "ptyprocess"
+    # Credentials at rest (api/secure_env.py / lib/cmds_secrets.sh):
+    # switch passwords and the Meraki API key are Fernet-encrypted.
+    "cryptography"
+  )
+
+  local all_ok=1
+  for pkg in "${PACKAGES[@]}"; do
+    python3 -m pip install -U "$pkg" >>"$log" 2>&1
+    if [[ $? -eq 0 ]]; then
+      step_ok "pip install ${pkg}"
+    else
+      step_fail "pip install ${pkg} failed — see ${log}"
+      all_ok=0
+    fi
+  done
+
+  # No Meraki SDK: CatOps Lite talks to the Meraki Dashboard API directly
+  # (api/meraki_integration.py -- urllib, Bearer auth, 429/Retry-After
+  # handling). Nothing imports the `meraki` package, and installing it
+  # needed --ignore-installed to fight the RPM-managed `requests`.
+
+  # Verify every module the backend imports (audited 2026-10-10)
+  if python3 -c "import fastapi, uvicorn, pam, pexpect, cryptography, pydantic, importlib.util as u; assert u.find_spec('python_multipart') or u.find_spec('multipart')" >>"$log" 2>&1; then
+    step_ok "Python imports verified (fastapi, uvicorn, multipart, pam, pexpect, cryptography)"
+  else
+    step_fail "A required Python module will not import -- see ${log}"
+    all_ok=0
+  fi
+
+  [[ $all_ok -eq 1 ]] && step_ok "All Python packages installed" || step_fail "Some Python packages failed — see ${log}"
+  sleep 1
+}
+
+# =============================================================
+# STEP 23 — DEPLOY CatOps Lite APP (from GitHub Release tarball)
+# =============================================================
+deploy_cmds_web() {
+  section "Deploy CatOps Lite Application"
+  local log="$LOGDIR/deploy.log"
+  : > "$log"
+
+  local TARBALL_URL="https://github.com/fumatchu/CatOps/releases/latest/download/catops-lite.tar.gz"
+  local TARBALL="/tmp/catops-lite.tar.gz"
+
+  # Download tarball from GitHub Releases
+  step_info "Downloading application package from GitHub..."
+  wget -q -O "$TARBALL" "$TARBALL_URL" 2>>"$log"
+  if [[ $? -ne 0 || ! -s "$TARBALL" ]]; then
+    step_fail "Download failed: ${TARBALL_URL}"
+    step_info "Make sure a GitHub Release exists on fumatchu/CatOps with catops-lite.tar.gz attached."
+    step_info "See: prepare-release.sh to build and upload the package."
+    return 1
+  fi
+  local SIZE; SIZE=$(du -sh "$TARBALL" | cut -f1)
+  step_ok "Downloaded catops-lite.tar.gz (${SIZE})"
+
+  # Back up any existing install
+  if [[ -d "$INSTALL_BASE" ]]; then
+    local BACKUP="${INSTALL_BASE}.bak.$(date +%Y%m%d%H%M%S)"
+    step_info "Backing up existing install to ${BACKUP}..."
+    mv "$INSTALL_BASE" "$BACKUP" >>"$log" 2>&1 && step_ok "Backup created" || step_info "Backup skipped (non-fatal)"
+  fi
+
+  # Extract
+  step_info "Extracting to /opt/..."
+  tar -xzf "$TARBALL" -C /opt/ >>"$log" 2>&1
+  if [[ $? -ne 0 ]]; then
+    step_fail "Extraction failed — see ${log}"
+    return 1
+  fi
+  step_ok "Extracted to ${INSTALL_BASE}"
+  rm -f "$TARBALL"
+
+  # Ensure runtime dirs exist (emptied before packaging)
+  mkdir -p \
+    "${INSTALL_BASE}/data"  \
+    "${INSTALL_BASE}/logs"  \
+    "${INSTALL_BASE}/runs"  \
+    "${INSTALL_BASE}/state" \
+    "${INSTALL_BASE}/tmp"
+  step_ok "Runtime directories ready"
+
+  # ── Permissions ──────────────────────────────────────────
+  step_info "Setting file permissions..."
+
+  # All directories: 755
+  find "$INSTALL_BASE" -type d -exec chmod 755 {} \;
+
+  # Python / config files: 644
+  find "${INSTALL_BASE}/api" -type f \
+    \( -name "*.py" -o -name "*.json" -o -name "*.yaml" -o -name "*.env.example" \) \
+    -exec chmod 644 {} \;
+
+  # Web-served content: 644
+  find "${INSTALL_BASE}/ui"           -type f -exec chmod 644 {} \;
+  find "${INSTALL_BASE}/docs"         -type f -exec chmod 644 {} \;
+  find "${INSTALL_BASE}/uplink_types" -type f -exec chmod 644 {} \; 2>/dev/null || true
+
+  # Strip ACL flags (CRITICAL — SFTP/Mountain Duck sets ACL+ which causes 403)
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -R -b "${INSTALL_BASE}/ui"   >>"$log" 2>&1 || true
+    setfacl -R -b "${INSTALL_BASE}/docs" >>"$log" 2>&1 || true
+    step_ok "ACL flags stripped from ui/ and docs/"
+  fi
+
+  # Shell scripts in scripts/ AND lib/: 700
+  find "${INSTALL_BASE}/scripts" -type f -name "*.sh" -exec chmod 700 {} \;
+  find "${INSTALL_BASE}/lib"     -type f -name "*.sh" -exec chmod 700 {} \;
+  step_ok "Shell scripts (scripts/ and lib/) set to 700"
+
+  # lib/ non-sh files: 644
+  find "${INSTALL_BASE}/lib" -type f ! -name "*.sh" -exec chmod 644 {} \;
+
+  # Runtime dirs: 755
+  chmod 755 \
+    "${INSTALL_BASE}/data"  \
+    "${INSTALL_BASE}/logs"  \
+    "${INSTALL_BASE}/runs"  \
+    "${INSTALL_BASE}/state" \
+    "${INSTALL_BASE}/tmp"
+
+  step_ok "All permissions set"
+  sleep 1
+}
+
+# =============================================================
+# STEP 24 — SELINUX FOR CatOps Lite
+# =============================================================
+configure_selinux_cmds() {
+  section "SELinux — CatOps Lite"
+  local log="$LOGDIR/selinux-cmds.log"
+  : > "$log"
+
+  if ! command -v semanage >/dev/null 2>&1; then
+    step_fail "semanage not found — install policycoreutils-python-utils"
+    return 1
+  fi
+
+  # UI and docs served by Apache
+  for dir in ui docs; do
+    semanage fcontext -a -t httpd_sys_content_t \
+      "${INSTALL_BASE}/${dir}(/.*)?" >>"$log" 2>&1 \
+      || semanage fcontext -m -t httpd_sys_content_t \
+        "${INSTALL_BASE}/${dir}(/.*)?" >>"$log" 2>&1 || true
+    restorecon -Rv "${INSTALL_BASE}/${dir}" >>"$log" 2>&1 || true
+    step_ok "SELinux: httpd_sys_content_t on ${dir}/"
+  done
+
+  # Allow Apache to proxy to uvicorn
+  setsebool -P httpd_can_network_connect 1 >>"$log" 2>&1
+  step_ok "SELinux: httpd_can_network_connect enabled"
+
+  sleep 1
+}
+
+# =============================================================
+# STEP 24b — SELF-SIGNED TLS CERTIFICATE
+# (adapted from RADS-WEB generate_ssl_cert — runs before configure_apache_cmds)
+# =============================================================
+generate_ssl_cert() {
+  section "TLS Certificate (self-signed)"
+  local log="$LOGDIR/ssl.log"
+  : > "$log"
+
+  local CERT="/etc/pki/tls/certs/cmds-go.crt"
+  local KEY="/etc/pki/tls/private/cmds-go.key"
+  local FQDN;  FQDN=$(hostname -f 2>/dev/null || hostname)
+  local SHORT; SHORT=$(hostname -s 2>/dev/null || hostname)
+  local SERVER_IP
+  SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null \
+    | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  [[ -z "$SERVER_IP" ]] && SERVER_IP=$(hostname -I | awk '{print $1}')
+
+  # Disable the default mod_ssl VirtualHost FIRST. cmds-go.conf declares
+  # its own "Listen 443", so ssl.conf's Listen would be a duplicate listener.
+  #
+  # Edit ssl.conf IN PLACE (comment out) rather than renaming it:
+  # ssl.conf ships from the mod_ssl RPM as %config(noreplace). If it is
+  # renamed away, the next mod_ssl update reinstalls a pristine copy and
+  # silently reintroduces the duplicate listener. Editing in place keeps
+  # DNF's noreplace protection (updates drop ssl.conf.rpmnew instead).
+  local DEFAULT_SSL="/etc/httpd/conf.d/ssl.conf"
+  local OLD_DISABLED="${DEFAULT_SSL}.disabled"
+
+  if [[ ! -f "$DEFAULT_SSL" && -f "$OLD_DISABLED" ]]; then
+    mv "$OLD_DISABLED" "$DEFAULT_SSL"
+    step_info "Restored ssl.conf from a previous .disabled rename"
+  fi
+
+  if [[ -f "$DEFAULT_SSL" ]]; then
+    if grep -qE '^[[:space:]]*Listen[[:space:]]+443' "$DEFAULT_SSL"; then
+      sed -i -E 's/^([[:space:]]*)(Listen[[:space:]]+443.*)/\1# \2  # disabled by CatOps Lite installer -- cmds-go.conf declares its own Listen 443/' "$DEFAULT_SSL"
+      step_ok "Default ssl.conf Listen 443 commented out in place (DNF-safe)"
+    else
+      step_ok "Default ssl.conf Listen 443 already disabled"
+    fi
+
+    # Commenting out Listen alone is not enough: <VirtualHost _default_:443>
+    # still matches cmds-go.conf's Listen 443, and it points at
+    # /etc/pki/tls/certs/localhost.crt, which mod_ssl never creates on
+    # Rocky 8+ -> configtest fails with AH00526. Comment the block out too.
+    if grep -qE '^[[:space:]]*<VirtualHost[[:space:]]+_default_:443>' "$DEFAULT_SSL"; then
+      sed -i '/^[[:space:]]*<VirtualHost[[:space:]]\+_default_:443>/,/^[[:space:]]*<\/VirtualHost>/ s/^/# /' "$DEFAULT_SSL"
+      step_ok "Default ssl.conf <VirtualHost _default_:443> block commented out (DNF-safe)"
+    else
+      step_ok "Default ssl.conf VirtualHost block already disabled"
+    fi
+  fi
+
+  if [[ -f "$CERT" && -f "$KEY" ]]; then
+    step_ok "Certificate already exists — skipping generation"
+  else
+    step_info "Generating 4096-bit RSA self-signed cert for ${FQDN} / ${SERVER_IP}..."
+    if openssl req -x509 \
+        -newkey rsa:4096 \
+        -keyout "$KEY" \
+        -out    "$CERT" \
+        -days   3650 \
+        -nodes \
+        -subj "/C=US/ST=Local/L=Local/O=CatOps-Lite/OU=Catalyst-Operations/CN=${FQDN}" \
+        -addext "subjectAltName=DNS:${FQDN},DNS:${SHORT},IP:${SERVER_IP}" \
+        >>"$log" 2>&1; then
+      chmod 600 "$KEY"
+      chmod 644 "$CERT"
+      step_ok "Self-signed cert generated (10-year / RSA-4096)"
+      step_ok "  CN : ${FQDN}"
+      step_ok "  SAN: DNS:${FQDN}, DNS:${SHORT}, IP:${SERVER_IP}"
+    else
+      step_fail "openssl cert generation failed — see ${log}"
+      return 1
+    fi
+  fi
+
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -v "$CERT" "$KEY" >>"$log" 2>&1 || true
+    step_ok "SELinux context restored on cert/key"
+  fi
+
+  sleep 1
+}
+
+# =============================================================
+# STEP 25 — APACHE VIRTUALHOST (HTTPS)
+# 443: UI, docs and API proxy (TLS terminates at Apache; the proxy to
+#      uvicorn on 127.0.0.1:8000 stays plain HTTP).
+# 80:  redirects to HTTPS, EXCEPT /images which must stay plain HTTP
+#      for switches pulling IOS-XE images.
+# Firmware uploads use wss://<host>:8443 (stunnel, configure_upload_tls).
+# =============================================================
+configure_apache_cmds() {
+  section "Apache VirtualHost (HTTPS)"
+  local log="$LOGDIR/apache.log"
+  local CONF="/etc/httpd/conf.d/cmds-go.conf"
+  : > "$log"
+
+  cat > "$CONF" <<'APACHECONF'
+# Keep long-running proxy connections alive for large IOS-XE uploads (1GB+)
+Timeout 600
+
+# Listen 443 normally comes from ssl.conf — declared here because
+# generate_ssl_cert disables that file's Listen/VirtualHost.
+Listen 443 https
+
+# =====================================================
+# PORT 80 — redirect to HTTPS, except /images
+# =====================================================
+<VirtualHost *:80>
+    # /images (Alias in tftp-images.conf) MUST stay plain HTTP:
+    # switches download IOS-XE images from http://<server>/images.
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/images(/|$)
+    RewriteRule ^/?(.*) https://%{HTTP_HOST}/$1 [R=301,L]
+
+    ErrorLog /var/log/httpd/cmds-go-error.log
+    CustomLog /var/log/httpd/cmds-go-access.log combined
+</VirtualHost>
+
+# =====================================================
+# PORT 443 — CatOps Lite UI / DOCS / API
+# =====================================================
+<VirtualHost *:443>
+    DocumentRoot "/opt/cmds-go/ui"
+    LimitRequestBody 2147483648
+
+    # SSL
+    SSLEngine             On
+    SSLCertificateFile    /etc/pki/tls/certs/cmds-go.crt
+    SSLCertificateKeyFile /etc/pki/tls/private/cmds-go.key
+    SSLProtocol           all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite        ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:HIGH:!aNULL:!MD5:!3DES
+    SSLHonorCipherOrder   On
+    SSLSessionTickets     Off
+
+    # Security headers (HSTS intentionally omitted: /images must stay
+    # reachable over plain HTTP for switches pulling firmware)
+    Header always set X-Frame-Options        "SAMEORIGIN"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy        "strict-origin-when-cross-origin"
+
+    # Disable mod_reqtimeout body limit — allows large IOS-XE uploads (1GB+)
+    # over slow/routed paths without Apache killing the connection mid-transfer.
+    # (Default body=20,MinRate=500 drops connections on I226-V NIC + inter-VLAN paths)
+    RequestReadTimeout body=0
+
+    # Prevent HTTP 408 mid-upload when chunk count exceeds MaxKeepAliveRequests
+    # default (100). 0 = unlimited requests per keepalive connection.
+    MaxKeepAliveRequests 0
+    KeepAliveTimeout 60
+
+    <Directory "/opt/cmds-go/ui">
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # =====================================================
+    # CMDS DOCS
+    # =====================================================
+    Alias /cmds-docs /opt/cmds-go/docs
+    <Directory "/opt/cmds-go/docs">
+        Options Indexes FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    DirectoryIndex index.html
+
+    # =====================================================
+    # API REVERSE PROXY  (unchanged from the HTTP config)
+    # =====================================================
+    ProxyRequests Off
+    ProxyPreserveHost On
+    ProxyTimeout 600
+
+    # Tell the backend the client connection was HTTPS
+    RequestHeader set X-Forwarded-Proto "https"
+
+    ProxyPass        /api/login http://127.0.0.1:8000/api/login
+    ProxyPassReverse /api/login http://127.0.0.1:8000/api/login
+
+    ProxyPass        /api/auth/check http://127.0.0.1:8000/api/auth/check
+    ProxyPassReverse /api/auth/check http://127.0.0.1:8000/api/auth/check
+
+    # WebSocket proxy — must come before the generic /api/ rule.
+    # mod_proxy_wstunnel handles the HTTP→WS upgrade handshake.
+    # (Browser side is wss:// via Apache; Apache→uvicorn stays ws://)
+    ProxyPass        /api/ws/ ws://127.0.0.1:8000/ws/
+    ProxyPassReverse /api/ws/ ws://127.0.0.1:8000/ws/
+
+    # disablereuse=On prevents Apache reusing a connection that uvicorn
+    # may have half-closed between requests.
+    ProxyPass        /api/ http://127.0.0.1:8000/ retry=0 disablereuse=On
+    ProxyPassReverse /api/ http://127.0.0.1:8000/
+
+    # =====================================================
+    # LOGGING
+    # =====================================================
+    ErrorLog /var/log/httpd/cmds-go-ssl-error.log
+    CustomLog /var/log/httpd/cmds-go-ssl-access.log combined
+</VirtualHost>
+APACHECONF
+
+  step_ok "VirtualHost written: ${CONF} (HTTPS 443, HTTP 80 → HTTPS except /images)"
+
+  # Make sure mod_proxy_wstunnel is enabled (required for WebSocket proxy)
+  if ! grep -q 'proxy_wstunnel_module' /etc/httpd/conf.modules.d/00-proxy.conf 2>/dev/null; then
+    echo "LoadModule proxy_wstunnel_module modules/mod_proxy_wstunnel.so" \
+      >> /etc/httpd/conf.modules.d/00-proxy.conf
+    step_ok "mod_proxy_wstunnel added to 00-proxy.conf"
+  else
+    step_ok "mod_proxy_wstunnel already present in 00-proxy.conf"
+  fi
+
+  # mod_ssl (from the mod_ssl package), mod_rewrite and mod_headers
+  # (httpd base) must be loaded for this config.
+  local mod
+  for mod in ssl_module rewrite_module headers_module; do
+    if grep -rqE "^[[:space:]]*LoadModule[[:space:]]+${mod}[[:space:]]" /etc/httpd/conf.modules.d/ 2>/dev/null; then
+      step_ok "${mod} loaded"
+    else
+      step_fail "${mod} not loaded — check mod_ssl / httpd packages"
+    fi
+  done
+
+  # Syntax test
+  local syntax_out
+  syntax_out=$(apachectl configtest 2>&1)
+  if echo "$syntax_out" | grep -q "Syntax OK"; then
+    step_ok "Apache config syntax OK"
+  else
+    step_fail "Apache config syntax error:"
+    echo "$syntax_out"
+  fi
+
+  # Enable and start httpd
+  systemctl enable --now httpd >>"$log" 2>&1
+  systemctl restart httpd >>"$log" 2>&1
+
+  if systemctl is-active --quiet httpd; then
+    step_ok "Apache (httpd) running with SSL"
+  else
+    step_fail "Apache failed to start — see ${log} and /var/log/httpd/error_log"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 26 — CatOps Lite SYSTEMD SERVICE
+# =============================================================
+install_cmds_service() {
+  section "CatOps Lite Service"
+  local SVC_FILE="/etc/systemd/system/cmds-go.service"
+  local log="$LOGDIR/cmds-service.log"
+  : > "$log"
+
+  cat > "$SVC_FILE" <<'EOF'
+[Unit]
+Description=CatOps Lite FastAPI Backend
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/cmds-go/api
+ExecStart=/usr/local/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload >>"$log" 2>&1
+  systemctl enable --now cmds-go >>"$log" 2>&1
+  sleep 3
+
+  if systemctl is-active --quiet cmds-go; then
+    step_ok "cmds-go service running"
+  else
+    step_fail "cmds-go service failed to start"
+    step_info "Check: journalctl -u cmds-go -n 50 --no-pager"
+  fi
+  sleep 1
+}
+
+# =============================================================
+# STEP 26b — IOS-XE UPLOAD TLS WRAPPER (stunnel)
+# The UI is HTTPS, and browsers block ws:// from an https:// page.
+# The IOS-XE upload deliberately talks DIRECTLY to uvicorn :8000
+# (Apache's proxy stalled large uploads), so stunnel wraps that
+# same connection in TLS on :8443 and relays raw TCP bytes to
+# 127.0.0.1:8000. No HTTP/WebSocket parsing or buffering;
+# uvicorn and the upload protocol are unchanged.
+#   Browser  wss://<server>:8443/ws/upload/iosxe
+#   stunnel  :8443 (TLS, cmds-go cert)  ->  127.0.0.1:8000 (plain)
+# SELinux: stunnel_t may bind/connect any TCP port and read
+# /etc/pki certs (Fedora/RHEL policy) — no booleans needed.
+# =============================================================
+configure_upload_tls() {
+  section "IOS-XE Upload TLS Wrapper (stunnel :8443)"
+  local log="$LOGDIR/upload-tls.log"
+  local CONF="/etc/stunnel/cmds-upload-tls.conf"
+  local SVC="/etc/systemd/system/cmds-upload-tls.service"
+  : > "$log"
+
+  if ! command -v stunnel >/dev/null 2>&1; then
+    step_fail "stunnel not installed — check package install"
+    return 1
+  fi
+  if [[ ! -f /etc/pki/tls/certs/cmds-go.crt || ! -f /etc/pki/tls/private/cmds-go.key ]]; then
+    step_fail "cmds-go certificate missing — generate_ssl_cert must run first"
+    return 1
+  fi
+
+  mkdir -p /etc/stunnel
+  cat > "$CONF" <<'EOF'
+; CatOps Lite — TLS wrapper for the direct IOS-XE upload WebSocket
+; Browser: wss://<server>:8443/ws/upload/iosxe  ->  uvicorn ws://127.0.0.1:8000
+; Pure TCP relay: no HTTP/WebSocket parsing or buffering.
+foreground = yes
+pid =
+syslog = yes
+debug = notice
+
+[cmds-upload]
+accept  = 0.0.0.0:8443
+connect = 127.0.0.1:8000
+cert    = /etc/pki/tls/certs/cmds-go.crt
+key     = /etc/pki/tls/private/cmds-go.key
+sslVersionMin = TLSv1.2
+; long idle allowance for multi-GB uploads on slow links (12h)
+TIMEOUTidle = 43200
+EOF
+  chmod 644 "$CONF"
+  step_ok "stunnel config written: ${CONF}"
+
+  cat > "$SVC" <<'EOF'
+[Unit]
+Description=CatOps Lite IOS-XE upload TLS wrapper (wss :8443 -> uvicorn :8000)
+After=network-online.target cmds-go.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/stunnel /etc/stunnel/cmds-upload-tls.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  step_ok "Service unit written: ${SVC}"
+
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -Rv /etc/stunnel "$SVC" >>"$log" 2>&1 || true
+    step_ok "SELinux context restored on stunnel config"
+  fi
+
+  systemctl daemon-reload >>"$log" 2>&1
+  systemctl enable cmds-upload-tls >>"$log" 2>&1
+  systemctl restart cmds-upload-tls >>"$log" 2>&1
+  sleep 2
+
+  if systemctl is-active --quiet cmds-upload-tls; then
+    step_ok "cmds-upload-tls running (wss :8443 -> 127.0.0.1:8000)"
+  else
+    step_fail "cmds-upload-tls failed to start"
+    step_info "Check: journalctl -u cmds-upload-tls -n 50 --no-pager"
+  fi
+  sleep 1
+}
+
+# (Cockpit removed — replaced by built-in Server Administration UI)
+
+# =============================================================
+# STEP 28 — CMDS CONSOLE AUTOSTART
+# Sets permissions on the admin console script and wires it
+# into /root/.bash_profile so root SSH logins land in the
+# console automatically.
+# =============================================================
+configure_cmds_console() {
+  section "CatOps Lite Console Autostart"
+
+  local CONSOLE_SCRIPT="/opt/cmds-go/console/cmds-console.sh"
+
+  if [[ ! -f "$CONSOLE_SCRIPT" ]]; then
+    step_fail "Console script not found: ${CONSOLE_SCRIPT} — skipping"
+    return 0
+  fi
+
+  chown root:root "$CONSOLE_SCRIPT"
+  chmod 700 "$CONSOLE_SCRIPT"
+  step_ok "Permissions set on ${CONSOLE_SCRIPT}"
+
+  # Add autostart block to /root/.bash_profile (idempotent)
+  if ! grep -q "# BEGIN CatOps Lite-CONSOLE" /root/.bash_profile 2>/dev/null; then
+    cat >> /root/.bash_profile << 'PROFILE_EOF'
+
+# BEGIN CatOps Lite-CONSOLE
+# Added by CatOps Lite installer — launches admin console on interactive SSH login.
+if tty -s && [[ -x /opt/cmds-go/console/cmds-console.sh ]]; then
+    /opt/cmds-go/console/cmds-console.sh
+fi
+# END CatOps Lite-CONSOLE
+PROFILE_EOF
+    step_ok "Console autostart added to /root/.bash_profile"
+  else
+    step_ok "Console autostart already present in /root/.bash_profile"
+  fi
+}
+
+# =============================================================
+# STEP 29 — CMDS UPDATE CHECK TIMER
+# Installs the daily GitHub update check (systemd timer).
+# Writes state to /opt/cmds-go/state/update_available.json
+# which the UI reads to show the update banner.
+# =============================================================
+install_update_timer() {
+  section "CatOps Lite Update Check Timer"
+  local INSTALL_DIR="/opt/cmds-go/installer"
+  local UPGRADE_DIR="/opt/cmds-go/upgrade"
+
+  # Copy scripts into upgrade/
+  mkdir -p "$UPGRADE_DIR"
+  cp "${INSTALL_DIR}/update_check.sh"  "${UPGRADE_DIR}/update_check.sh"
+  cp "${INSTALL_DIR}/cmds_upgrade.sh"  "${UPGRADE_DIR}/cmds_upgrade.sh"
+  chmod 700 "${UPGRADE_DIR}/update_check.sh"
+  chmod 700 "${UPGRADE_DIR}/cmds_upgrade.sh"
+  step_ok "Upgrade scripts installed to ${UPGRADE_DIR}/"
+
+  # Install systemd units
+  cp "${INSTALL_DIR}/cmds-update-check.service" /etc/systemd/system/
+  cp "${INSTALL_DIR}/cmds-update-check.timer"   /etc/systemd/system/
+  chmod 644 /etc/systemd/system/cmds-update-check.service
+  chmod 644 /etc/systemd/system/cmds-update-check.timer
+  step_ok "Systemd units installed"
+
+  # Enable and start timer
+  systemctl daemon-reload
+  systemctl enable --now cmds-update-check.timer
+
+  if systemctl is-active --quiet cmds-update-check.timer; then
+    step_ok "Update check timer active (runs daily)"
+  else
+    step_fail "Timer failed to start — check: systemctl status cmds-update-check.timer"
+  fi
+
+  # Run an initial check immediately so state file exists on first login
+  bash "${UPGRADE_DIR}/update_check.sh" || true
+  step_ok "Initial update check complete"
+  sleep 1
+}
+
+# =============================================================
+# STEP 30 — FINAL STATUS REPORT
+# =============================================================
+final_status_report() {
+  clear
+  section "Installation Summary"
+  echo ""
+
+  local services=("cmds-go" "cmds-upload-tls" "httpd" "tftp-server.socket" "fail2ban" "chronyd" "firewalld")
+
+  echo -e "  ${CYAN}Core Services:${TEXTRESET}"
+  for svc in "${services[@]}"; do
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      step_ok "${svc}"
+    else
+      step_fail "${svc} (not running)"
+    fi
+  done
+
+  echo ""
+  echo -e "  ${CYAN}Optional Services:${TEXTRESET}"
+
+  # DNS (BIND)
+  if [[ $INSTALL_BIND -eq 1 ]]; then
+    if systemctl is-active --quiet named 2>/dev/null; then
+      step_ok "named (DNS)"
+    else
+      step_ok "named (DNS) — installed, configure via the CatOps Lite UI"
+    fi
+  fi
+
+  # NTP (Chrony — optional install, not the core chronyd)
+  if [[ $INSTALL_NTP -eq 1 ]]; then
+    if systemctl is-active --quiet chronyd 2>/dev/null; then
+      step_ok "chronyd (NTP server) — installed, configure via the CatOps Lite UI"
+    else
+      step_ok "chronyd (NTP server) — installed, configure via the CatOps Lite UI"
+    fi
+  fi
+
+  # DHCP (Kea)
+  if [[ $INSTALL_DHCP -eq 1 ]]; then
+    if systemctl is-active --quiet kea-dhcp4 2>/dev/null; then
+      step_ok "kea-dhcp4"
+    else
+      step_ok "kea-dhcp4 — installed, configure via the CatOps Lite UI"
+    fi
+  fi
+
+  local server_ip
+  server_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || hostname -I | awk '{print $1}')
+
+  echo ""
+  echo -e "  ${CYAN}Access Points:${TEXTRESET}"
+  echo -e "  ${YELLOW}→${TEXTRESET}  Web UI:      https://${server_ip}/"
+
+  echo -e "  ${YELLOW}→${TEXTRESET}  Logs:        journalctl -u cmds-go -f"
+  echo -e "  ${YELLOW}→${TEXTRESET}  Installer log: ${LOGDIR}/"
+  echo ""
+  echo -e "  ${GREEN}CatOps Lite installation complete.${TEXTRESET}"
+  echo ""
+}
+
+# =============================================================
+# MAIN INSTALLATION FLOW
+# =============================================================
+main() {
+  # ── Resume detection (read state file early, act after interface is known) ──
+  RESUME_AFTER_NETWORK=0
+  RESUME_EXPECTED_IP=""
+  if [[ -f /root/.cmds_install_resume ]]; then
+    RESUME_AFTER_NETWORK=1
+    RESUME_EXPECTED_IP=$(grep -oP '(?<=ip=)\S+' /root/.cmds_install_resume || true)
+    rm -f /root/.cmds_install_resume
+    # Remove the auto-resume hook from .bashrc
+    sed -i '/# BEGIN CATOPS-AUTORESUME/,/# END CATOPS-AUTORESUME/d' /root/.bashrc
+  fi
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  check_root_and_os
+  check_and_enable_selinux
+  detect_active_interface   # sets $INTERFACE
+
+  if [[ $RESUME_AFTER_NETWORK -eq 1 ]]; then
+    section "Resuming Installation"
+    step_info "Resuming after DHCP→static IP reboot"
+    # Validate the static IP is actually in place before continuing
+    CURRENT_IP=$(nmcli -g IP4.ADDRESS device show "$INTERFACE" 2>/dev/null | head -1 | cut -d/ -f1)
+    if [[ -n "$RESUME_EXPECTED_IP" && "$CURRENT_IP" == "$RESUME_EXPECTED_IP" ]]; then
+      step_ok "Static IP confirmed: ${CURRENT_IP} on ${INTERFACE}"
+    elif [[ -z "$RESUME_EXPECTED_IP" ]]; then
+      step_ok "Continuing install — network reboot complete"
+    else
+      step_fail "Expected ${RESUME_EXPECTED_IP} but ${INTERFACE} shows ${CURRENT_IP:-none}"
+      dialog --title "Network Validation Failed" \
+        --yesno "Static IP did not apply as expected.\n\nExpected: ${RESUME_EXPECTED_IP}\nFound:    ${CURRENT_IP:-none} on ${INTERFACE}\n\nContinue anyway?" 11 62
+      [[ $? -ne 0 ]] && exit 1
+    fi
+  else
+    prompt_static_ip_if_dhcp
+  fi
+
+  check_internet_connectivity
+  validate_and_set_hostname
+  show_server_checklist     # welcome + "have these ready" notice BEFORE service selection
+  service_menu_checklist    # operator picks optional services to install
+  enable_repos
+  run_system_upgrade
+  update_and_install_packages
+  vm_detection
+  configure_bind_caching
+  configure_ntp
+  configure_dhcp_kea
+  configure_firewall
+  configure_fail2ban
+  update_issue_file
+  disable_bracketed_paste
+  tftp_setup_module
+  http_repo_setup_module
+  create_iosxe_symlink_module
+  images_autofix_module
+  install_python_packages
+  deploy_cmds_web
+  configure_selinux_cmds
+  generate_ssl_cert
+  configure_apache_cmds
+  install_cmds_service
+  configure_upload_tls
+
+  configure_cmds_console
+  install_update_timer
+  final_status_report
+
+  # ── Cleanup installer artifacts ───────────────────────────
+  # Remove installer files from /root so nothing re-runs on next login/reboot.
+  step_info "Cleaning up installer files..."
+  rm -rf "$SRC_BASE"                          # /root/CatOpsInstaller/
+  rm -f  /root/.cmds_install_resume           # state file (should already be gone)
+  # Belt-and-suspenders: remove auto-resume hook from .bashrc if still present
+  sed -i '/# BEGIN CATOPS-AUTORESUME/,/# END CATOPS-AUTORESUME/d' /root/.bashrc 2>/dev/null || true
+  step_ok "Installer files removed"
+
+  # ── Final reboot ─────────────────────────────────────────
+  # Ensures the upgraded kernel (from dnf upgrade) and all service
+  # changes take effect cleanly.
+  local server_ip
+  server_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | \
+    awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || \
+    hostname -I | awk '{print $1}')
+
+  echo ""
+  echo -e "${GREEN}══════════════════════════════════════════════════${TEXTRESET}"
+  echo -e "${GREEN}  CatOps Lite installation complete.${TEXTRESET}"
+  echo -e "${GREEN}══════════════════════════════════════════════════${TEXTRESET}"
+  echo ""
+  echo -e "  ${CYAN}Install log:${TEXTRESET}  ${LOGDIR}/"
+  echo -e "  ${CYAN}Web UI:${TEXTRESET}       https://${server_ip}/"
+
+  echo ""
+  echo -e "  Log files are available at: ${LOGDIR}/"
+  echo ""
+  read -rp "  Press Enter to reboot... " _
+  reboot
+}
+
+main
